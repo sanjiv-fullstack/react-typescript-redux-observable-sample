@@ -4,89 +4,46 @@ using System.Text.Json.Nodes;
 using System.Threading.Channels;
 
 var builder = WebApplication.CreateBuilder(args);
-builder.Services.AddSingleton<McpRequestHandler>();
-builder.Services.AddSingleton<SseSessionStore>();
-builder.Services.AddCors(options =>
-{
-    options.AddDefaultPolicy(policy =>
-    {
-        policy.AllowAnyOrigin().AllowAnyHeader().AllowAnyMethod();
-    });
-});
+builder.Services.AddSingleton<McpHandler>();
+builder.Services.AddSingleton<SseSessions>();
 
 var app = builder.Build();
-app.UseCors();
-app.Use(async (context, next) =>
-{
-    Console.Error.WriteLine($"[{DateTime.UtcNow:O}] {context.Request.Method} {context.Request.Path}{context.Request.QueryString}");
-    await next();
-});
 
-var mcpUrl = Environment.GetEnvironmentVariable("MCP_SERVER_URL") ?? "http://localhost:6060";
+var listenUrl = Environment.GetEnvironmentVariable("MCP_SERVER_URL") ?? "http://localhost:6060";
 app.Urls.Clear();
-app.Urls.Add(mcpUrl);
+app.Urls.Add(listenUrl);
 
-app.MapGet("/", () => Results.Ok(new
+// SSE transport endpoint used by MCP clients.
+app.MapGet("/mcp/sse", async (HttpContext context, SseSessions sessions) =>
 {
-    service = "SimpleMcpServer",
-    transport = "http+sse-compat",
-    endpoint = "/mcp",
-    sseEndpoint = "/sse",
-    messagesEndpoint = "/mcp/messages?sessionId={sessionId}"
-}));
-
-app.MapGet("/health", () => Results.Ok(new
-{
-    status = "ok",
-    nowUtc = DateTime.UtcNow
-}));
-
-app.MapGet("/sse", async (HttpContext context, SseSessionStore sessions) =>
-{
-    await HandleSseSessionAsync(context, sessions);
+    await HandleSseAsync(context, sessions);
 });
 
-app.MapGet("/mcp/sse", async (HttpContext context, SseSessionStore sessions) =>
+// Streamable HTTP endpoint used by MCP clients.
+app.MapPost("/mcp", async (HttpContext context, McpHandler handler) =>
 {
-    await HandleSseSessionAsync(context, sessions);
-});
-
-app.MapGet("/mcp", async (HttpContext context, SseSessionStore sessions) =>
-{
-    await HandleSseSessionAsync(context, sessions);
-});
-
-app.MapPost("/mcp", async (HttpContext context, McpRequestHandler handler) =>
-{
-    var requestNode = await JsonNode.ParseAsync(context.Request.Body) as JsonObject;
-    if (requestNode is null)
+    var request = await JsonNode.ParseAsync(context.Request.Body) as JsonObject;
+    if (request is null)
     {
-        return Results.BadRequest(new { error = "Invalid JSON request body" });
+        return Results.BadRequest(new { error = "Invalid JSON body" });
     }
 
-    var responseNode = await handler.HandleAsync(requestNode);
-    if (responseNode is null)
+    var response = await handler.HandleAsync(request);
+    if (response is null)
     {
         return Results.Accepted();
     }
 
-    if (context.Request.Headers.Accept.ToString().Contains("text/event-stream", StringComparison.OrdinalIgnoreCase))
-    {
-        context.Response.Headers.CacheControl = "no-cache";
-        context.Response.ContentType = "text/event-stream";
-        await WriteSseEventAsync(context, "message", responseNode.ToJsonString(McpRequestHandler.JsonOptions));
-        return Results.Empty;
-    }
-
-    return Results.Json(responseNode, McpRequestHandler.JsonOptions);
+    return Results.Json(response, McpHandler.JsonOptions);
 });
 
-app.MapPost("/messages", async (HttpContext context, SseSessionStore sessions, McpRequestHandler handler) =>
+// SSE companion messages endpoint.
+app.MapPost("/mcp/messages", async (HttpContext context, SseSessions sessions, McpHandler handler) =>
 {
     var sessionId = context.Request.Query["sessionId"].ToString();
     if (string.IsNullOrWhiteSpace(sessionId))
     {
-        return Results.BadRequest(new { error = "Missing sessionId query parameter" });
+        return Results.BadRequest(new { error = "Missing sessionId" });
     }
 
     if (!sessions.TryGetWriter(sessionId, out var writer))
@@ -94,44 +51,16 @@ app.MapPost("/messages", async (HttpContext context, SseSessionStore sessions, M
         return Results.NotFound(new { error = "Unknown or expired session" });
     }
 
-    var requestNode = await JsonNode.ParseAsync(context.Request.Body) as JsonObject;
-    if (requestNode is null)
+    var request = await JsonNode.ParseAsync(context.Request.Body) as JsonObject;
+    if (request is null)
     {
-        return Results.BadRequest(new { error = "Invalid JSON request body" });
+        return Results.BadRequest(new { error = "Invalid JSON body" });
     }
 
-    var responseNode = await handler.HandleAsync(requestNode);
-    if (responseNode is not null)
+    var response = await handler.HandleAsync(request);
+    if (response is not null)
     {
-        await writer.WriteAsync(responseNode.ToJsonString(McpRequestHandler.JsonOptions), context.RequestAborted);
-    }
-
-    return Results.Accepted();
-});
-
-app.MapPost("/mcp/messages", async (HttpContext context, SseSessionStore sessions, McpRequestHandler handler) =>
-{
-    var sessionId = context.Request.Query["sessionId"].ToString();
-    if (string.IsNullOrWhiteSpace(sessionId))
-    {
-        return Results.BadRequest(new { error = "Missing sessionId query parameter" });
-    }
-
-    if (!sessions.TryGetWriter(sessionId, out var writer))
-    {
-        return Results.NotFound(new { error = "Unknown or expired session" });
-    }
-
-    var requestNode = await JsonNode.ParseAsync(context.Request.Body) as JsonObject;
-    if (requestNode is null)
-    {
-        return Results.BadRequest(new { error = "Invalid JSON request body" });
-    }
-
-    var responseNode = await handler.HandleAsync(requestNode);
-    if (responseNode is not null)
-    {
-        await writer.WriteAsync(responseNode.ToJsonString(McpRequestHandler.JsonOptions), context.RequestAborted);
+        await writer.WriteAsync(response.ToJsonString(McpHandler.JsonOptions), context.RequestAborted);
     }
 
     return Results.Accepted();
@@ -139,34 +68,35 @@ app.MapPost("/mcp/messages", async (HttpContext context, SseSessionStore session
 
 app.Run();
 
-static async Task HandleSseSessionAsync(HttpContext context, SseSessionStore sessions)
+static async Task HandleSseAsync(HttpContext context, SseSessions sessions)
 {
     context.Response.Headers.CacheControl = "no-cache";
     context.Response.Headers.Connection = "keep-alive";
     context.Response.ContentType = "text/event-stream";
 
-    var session = sessions.CreateSession();
-    var messageUrl = $"{context.Request.Scheme}://{context.Request.Host}/mcp/messages?sessionId={session.SessionId}";
+    var session = sessions.Create();
+    var endpoint = $"{context.Request.Scheme}://{context.Request.Host}/mcp/messages?sessionId={session.SessionId}";
 
-    await WriteSseEventAsync(context, "endpoint", messageUrl);
-    await WriteSseEventAsync(context, "ready", "{\"message\":\"sse connected\"}");
+    await WriteEventAsync(context, "endpoint", endpoint);
+    await WriteEventAsync(context, "ready", "{\"status\":\"connected\"}");
 
     try
     {
         while (!context.RequestAborted.IsCancellationRequested)
         {
-            if (session.Reader.TryRead(out var pendingMessage))
+            if (session.Reader.TryRead(out var payload))
             {
-                await WriteSseEventAsync(context, "message", pendingMessage);
+                await WriteEventAsync(context, "message", payload);
                 continue;
             }
 
-            var hasPendingTask = session.Reader.WaitToReadAsync(context.RequestAborted).AsTask();
-            var pingDelayTask = Task.Delay(TimeSpan.FromSeconds(15), context.RequestAborted);
-            var completed = await Task.WhenAny(hasPendingTask, pingDelayTask);
-            if (completed == pingDelayTask)
+            var waitTask = session.Reader.WaitToReadAsync(context.RequestAborted).AsTask();
+            var pingTask = Task.Delay(TimeSpan.FromSeconds(15), context.RequestAborted);
+            var completed = await Task.WhenAny(waitTask, pingTask);
+
+            if (completed == pingTask)
             {
-                await WriteSseEventAsync(context, "ping", $"{{\"utc\":\"{DateTime.UtcNow:O}\"}}");
+                await WriteEventAsync(context, "ping", $"{{\"utc\":\"{DateTime.UtcNow:O}\"}}");
             }
         }
     }
@@ -175,33 +105,33 @@ static async Task HandleSseSessionAsync(HttpContext context, SseSessionStore ses
     }
     finally
     {
-        sessions.RemoveSession(session.SessionId);
+        sessions.Remove(session.SessionId);
     }
 }
 
-static async Task WriteSseEventAsync(HttpContext context, string eventName, string data)
+static async Task WriteEventAsync(HttpContext context, string eventName, string data)
 {
     await context.Response.WriteAsync($"event: {eventName}\n");
     await context.Response.WriteAsync($"data: {data}\n\n");
     await context.Response.Body.FlushAsync();
 }
 
-internal sealed class SseSessionStore
+internal sealed class SseSessions
 {
-    private readonly ConcurrentDictionary<string, Channel<string>> _sessions = new();
+    private readonly ConcurrentDictionary<string, Channel<string>> _channels = new();
 
-    public SseSession CreateSession()
+    public Session Create()
     {
         var sessionId = Guid.NewGuid().ToString("N");
         var channel = Channel.CreateUnbounded<string>();
-        _sessions[sessionId] = channel;
-        return new SseSession(sessionId, channel.Reader);
+        _channels[sessionId] = channel;
+        return new Session(sessionId, channel.Reader);
     }
 
     public bool TryGetWriter(string sessionId, out ChannelWriter<string> writer)
     {
         writer = default!;
-        if (!_sessions.TryGetValue(sessionId, out var channel))
+        if (!_channels.TryGetValue(sessionId, out var channel))
         {
             return false;
         }
@@ -210,57 +140,44 @@ internal sealed class SseSessionStore
         return true;
     }
 
-    public void RemoveSession(string sessionId)
+    public void Remove(string sessionId)
     {
-        _sessions.TryRemove(sessionId, out _);
+        _channels.TryRemove(sessionId, out _);
     }
 }
 
-internal sealed record SseSession(string SessionId, ChannelReader<string> Reader);
+internal sealed record Session(string SessionId, ChannelReader<string> Reader);
 
-internal sealed class McpRequestHandler
+internal sealed class McpHandler
 {
     public static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web)
     {
         WriteIndented = false
     };
 
-    private readonly HttpClient _httpClient = new();
-    private readonly string _apiBaseUrl;
-
-    public McpRequestHandler()
-    {
-        _apiBaseUrl = Environment.GetEnvironmentVariable("SIMPLE_API_URL") ?? "http://localhost:5055";
-    }
-
-    public async Task<JsonObject?> HandleAsync(JsonObject message)
+    public Task<JsonObject?> HandleAsync(JsonObject message)
     {
         var method = message["method"]?.GetValue<string>();
-        var idNode = message["id"];
-        var isRequest = idNode is not null;
+        var id = message["id"];
+        var isRequest = id is not null;
 
         if (string.IsNullOrWhiteSpace(method))
         {
-            return isRequest ? BuildError(idNode, -32600, "Invalid Request: method is required") : null;
+            return Task.FromResult<JsonObject?>(isRequest ? Error(id, -32600, "Invalid Request: method is required") : null);
         }
 
-        switch (method)
+        return method switch
         {
-            case "initialize":
-                return isRequest ? BuildResult(idNode!, BuildInitializeResult()) : null;
-            case "notifications/initialized":
-            case "notifications/cancelled":
-                return null;
-            case "tools/list":
-                return isRequest ? BuildResult(idNode!, BuildToolsListResult()) : null;
-            case "tools/call":
-                return isRequest ? BuildResult(idNode!, await ExecuteToolAsync(message["params"] as JsonObject)) : null;
-            default:
-                return isRequest ? BuildError(idNode, -32601, $"Method not found: {method}") : null;
-        }
+            "initialize" => Task.FromResult<JsonObject?>(isRequest ? Result(id!, InitializeResult()) : null),
+            "notifications/initialized" => Task.FromResult<JsonObject?>(null),
+            "notifications/cancelled" => Task.FromResult<JsonObject?>(null),
+            "tools/list" => Task.FromResult<JsonObject?>(isRequest ? Result(id!, ToolsListResult()) : null),
+            "tools/call" => Task.FromResult<JsonObject?>(isRequest ? Result(id!, ExecuteTool(message["params"] as JsonObject)) : null),
+            _ => Task.FromResult<JsonObject?>(isRequest ? Error(id, -32601, $"Method not found: {method}") : null)
+        };
     }
 
-    private static JsonObject BuildInitializeResult()
+    private static JsonObject InitializeResult()
     {
         return new JsonObject
         {
@@ -275,12 +192,12 @@ internal sealed class McpRequestHandler
             ["serverInfo"] = new JsonObject
             {
                 ["name"] = "simple-mcp-server",
-                ["version"] = "1.3.0"
+                ["version"] = "1.4.0"
             }
         };
     }
 
-    private static JsonObject BuildToolsListResult()
+    private static JsonObject ToolsListResult()
     {
         return new JsonObject
         {
@@ -305,25 +222,8 @@ internal sealed class McpRequestHandler
                 },
                 new JsonObject
                 {
-                    ["name"] = "rest_hello",
-                    ["description"] = "Calls the REST API /hello endpoint.",
-                    ["inputSchema"] = new JsonObject
-                    {
-                        ["type"] = "object",
-                        ["properties"] = new JsonObject
-                        {
-                            ["name"] = new JsonObject
-                            {
-                                ["type"] = "string",
-                                ["description"] = "Optional name passed to /hello?name=."
-                            }
-                        }
-                    }
-                },
-                new JsonObject
-                {
                     ["name"] = "ping",
-                    ["description"] = "Returns a pong response for transport and approval testing.",
+                    ["description"] = "Returns a pong response.",
                     ["inputSchema"] = new JsonObject
                     {
                         ["type"] = "object",
@@ -334,46 +234,25 @@ internal sealed class McpRequestHandler
         };
     }
 
-    private async Task<JsonObject> ExecuteToolAsync(JsonObject? parameters)
+    private static JsonObject ExecuteTool(JsonObject? parameters)
     {
         var toolName = parameters?["name"]?.GetValue<string>();
         var arguments = parameters?["arguments"] as JsonObject;
 
         if (string.IsNullOrWhiteSpace(toolName))
         {
-            return ErrorToolResult("Missing tool name.");
+            return ToolError("Missing tool name.");
         }
 
         return toolName switch
         {
-            "echo" => SuccessToolResult(arguments?["message"]?.GetValue<string>() ?? "(empty)"),
-            "rest_hello" => await CallRestHelloToolAsync(arguments),
-            "ping" => SuccessToolResult($"pong {DateTime.UtcNow:O}"),
-            _ => ErrorToolResult($"Unknown tool: {toolName}")
+            "echo" => ToolOk(arguments?["message"]?.GetValue<string>() ?? "(empty)"),
+            "ping" => ToolOk($"pong {DateTime.UtcNow:O}"),
+            _ => ToolError($"Unknown tool: {toolName}")
         };
     }
 
-    private async Task<JsonObject> CallRestHelloToolAsync(JsonObject? arguments)
-    {
-        var name = arguments?["name"]?.GetValue<string>();
-        var endpoint = string.IsNullOrWhiteSpace(name) ? "/hello" : $"/hello?name={Uri.EscapeDataString(name)}";
-
-        try
-        {
-            var response = await _httpClient.GetAsync($"{_apiBaseUrl.TrimEnd('/')}{endpoint}");
-            var content = await response.Content.ReadAsStringAsync();
-
-            return response.IsSuccessStatusCode
-                ? SuccessToolResult(content)
-                : ErrorToolResult($"REST call failed: {(int)response.StatusCode} {response.ReasonPhrase}. Body: {content}");
-        }
-        catch (Exception ex)
-        {
-            return ErrorToolResult($"REST call exception: {ex.Message}");
-        }
-    }
-
-    private static JsonObject SuccessToolResult(string text)
+    private static JsonObject ToolOk(string text)
     {
         return new JsonObject
         {
@@ -389,7 +268,7 @@ internal sealed class McpRequestHandler
         };
     }
 
-    private static JsonObject ErrorToolResult(string text)
+    private static JsonObject ToolError(string text)
     {
         return new JsonObject
         {
@@ -405,7 +284,7 @@ internal sealed class McpRequestHandler
         };
     }
 
-    private static JsonObject BuildResult(JsonNode id, JsonObject result)
+    private static JsonObject Result(JsonNode id, JsonObject result)
     {
         return new JsonObject
         {
@@ -415,7 +294,7 @@ internal sealed class McpRequestHandler
         };
     }
 
-    private static JsonObject BuildError(JsonNode? id, int code, string message)
+    private static JsonObject Error(JsonNode? id, int code, string message)
     {
         return new JsonObject
         {
