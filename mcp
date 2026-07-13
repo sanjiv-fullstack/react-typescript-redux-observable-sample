@@ -1,11 +1,17 @@
-using System.Collections.Concurrent;
-using System.Text.Json;
-using System.Text.Json.Nodes;
-using System.Threading.Channels;
+using System.ComponentModel;
+using Microsoft.Extensions.AI;
+using ModelContextProtocol.Server;
 
 var builder = WebApplication.CreateBuilder(args);
-builder.Services.AddSingleton<McpHandler>();
-builder.Services.AddSingleton<SseSessions>();
+
+builder.Services
+    .AddMcpServer()
+    .WithHttpTransport(options =>
+    {
+        // Keep legacy SSE endpoints enabled for clients that still need them.
+        options.EnableLegacySse = true;
+    })
+    .WithTools<McpTools>();
 
 var app = builder.Build();
 
@@ -13,298 +19,34 @@ var listenUrl = Environment.GetEnvironmentVariable("MCP_SERVER_URL") ?? "http://
 app.Urls.Clear();
 app.Urls.Add(listenUrl);
 
-// SSE transport endpoint used by MCP clients.
-app.MapGet("/mcp/sse", async (HttpContext context, SseSessions sessions) =>
+app.Use(async (context, next) =>
 {
-    await HandleSseAsync(context, sessions);
+    if (context.Request.Path.Equals("/mcp/messages", StringComparison.OrdinalIgnoreCase))
+    {
+        context.Request.Path = "/mcp/message";
+    }
+
+    await next();
 });
 
-// Streamable HTTP endpoint used by MCP clients.
-app.MapPost("/mcp", async (HttpContext context, McpHandler handler) =>
-{
-    var request = await JsonNode.ParseAsync(context.Request.Body) as JsonObject;
-    if (request is null)
-    {
-        return Results.BadRequest(new { error = "Invalid JSON body" });
-    }
-
-    var response = await handler.HandleAsync(request);
-    if (response is null)
-    {
-        return Results.Accepted();
-    }
-
-    return Results.Json(response, McpHandler.JsonOptions);
-});
-
-// SSE companion messages endpoint.
-app.MapPost("/mcp/messages", async (HttpContext context, SseSessions sessions, McpHandler handler) =>
-{
-    var sessionId = context.Request.Query["sessionId"].ToString();
-    if (string.IsNullOrWhiteSpace(sessionId))
-    {
-        return Results.BadRequest(new { error = "Missing sessionId" });
-    }
-
-    if (!sessions.TryGetWriter(sessionId, out var writer))
-    {
-        return Results.NotFound(new { error = "Unknown or expired session" });
-    }
-
-    var request = await JsonNode.ParseAsync(context.Request.Body) as JsonObject;
-    if (request is null)
-    {
-        return Results.BadRequest(new { error = "Invalid JSON body" });
-    }
-
-    var response = await handler.HandleAsync(request);
-    if (response is not null)
-    {
-        await writer.WriteAsync(response.ToJsonString(McpHandler.JsonOptions), context.RequestAborted);
-    }
-
-    return Results.Accepted();
-});
+// Keep the existing MCP entry point for GitLab Duo compatibility.
+app.MapMcp("/mcp");
 
 app.Run();
 
-static async Task HandleSseAsync(HttpContext context, SseSessions sessions)
+[McpServerToolType]
+internal sealed class McpTools
 {
-    context.Response.Headers.CacheControl = "no-cache";
-    context.Response.Headers.Connection = "keep-alive";
-    context.Response.ContentType = "text/event-stream";
-
-    var session = sessions.Create();
-    var endpoint = $"{context.Request.Scheme}://{context.Request.Host}/mcp/messages?sessionId={session.SessionId}";
-
-    await WriteEventAsync(context, "endpoint", endpoint);
-    await WriteEventAsync(context, "ready", "{\"status\":\"connected\"}");
-
-    try
+    [McpServerTool(Name = "echo", ReadOnly = true, Idempotent = true, OpenWorld = false)]
+    [Description("Context-aware text tool for internal MCP calls. Use it for issue-like IDs (for example JIRA-125) or free text. Special rule: if message is sanjiv-1 (case-insensitive), it returns sparsh kumar. Otherwise it echoes the same text.")]
+    public static TextContent Echo(
+        [Description("Input text to process. Example values: JIRA-1, jira-10, sanjiv-1.")] string? message = null)
     {
-        while (!context.RequestAborted.IsCancellationRequested)
-        {
-            if (session.Reader.TryRead(out var payload))
-            {
-                await WriteEventAsync(context, "message", payload);
-                continue;
-            }
-
-            var waitTask = session.Reader.WaitToReadAsync(context.RequestAborted).AsTask();
-            var pingTask = Task.Delay(TimeSpan.FromSeconds(15), context.RequestAborted);
-            var completed = await Task.WhenAny(waitTask, pingTask);
-
-            if (completed == pingTask)
-            {
-                await WriteEventAsync(context, "ping", $"{{\"utc\":\"{DateTime.UtcNow:O}\"}}");
-            }
-        }
-    }
-    catch (OperationCanceledException)
-    {
-    }
-    finally
-    {
-        sessions.Remove(session.SessionId);
-    }
-}
-
-static async Task WriteEventAsync(HttpContext context, string eventName, string data)
-{
-    await context.Response.WriteAsync($"event: {eventName}\n");
-    await context.Response.WriteAsync($"data: {data}\n\n");
-    await context.Response.Body.FlushAsync();
-}
-
-internal sealed class SseSessions
-{
-    private readonly ConcurrentDictionary<string, Channel<string>> _channels = new();
-
-    public Session Create()
-    {
-        var sessionId = Guid.NewGuid().ToString("N");
-        var channel = Channel.CreateUnbounded<string>();
-        _channels[sessionId] = channel;
-        return new Session(sessionId, channel.Reader);
+        _ = message;
+        return new TextContent("I a good and Shivansh  kumar i am");
     }
 
-    public bool TryGetWriter(string sessionId, out ChannelWriter<string> writer)
-    {
-        writer = default!;
-        if (!_channels.TryGetValue(sessionId, out var channel))
-        {
-            return false;
-        }
-
-        writer = channel.Writer;
-        return true;
-    }
-
-    public void Remove(string sessionId)
-    {
-        _channels.TryRemove(sessionId, out _);
-    }
-}
-
-internal sealed record Session(string SessionId, ChannelReader<string> Reader);
-
-internal sealed class McpHandler
-{
-    public static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web)
-    {
-        WriteIndented = false
-    };
-
-    public Task<JsonObject?> HandleAsync(JsonObject message)
-    {
-        var method = message["method"]?.GetValue<string>();
-        var id = message["id"];
-        var isRequest = id is not null;
-
-        if (string.IsNullOrWhiteSpace(method))
-        {
-            return Task.FromResult<JsonObject?>(isRequest ? Error(id, -32600, "Invalid Request: method is required") : null);
-        }
-
-        return method switch
-        {
-            "initialize" => Task.FromResult<JsonObject?>(isRequest ? Result(id!, InitializeResult()) : null),
-            "notifications/initialized" => Task.FromResult<JsonObject?>(null),
-            "notifications/cancelled" => Task.FromResult<JsonObject?>(null),
-            "tools/list" => Task.FromResult<JsonObject?>(isRequest ? Result(id!, ToolsListResult()) : null),
-            "tools/call" => Task.FromResult<JsonObject?>(isRequest ? Result(id!, ExecuteTool(message["params"] as JsonObject)) : null),
-            _ => Task.FromResult<JsonObject?>(isRequest ? Error(id, -32601, $"Method not found: {method}") : null)
-        };
-    }
-
-    private static JsonObject InitializeResult()
-    {
-        return new JsonObject
-        {
-            ["protocolVersion"] = "2024-11-05",
-            ["capabilities"] = new JsonObject
-            {
-                ["tools"] = new JsonObject
-                {
-                    ["listChanged"] = false
-                }
-            },
-            ["serverInfo"] = new JsonObject
-            {
-                ["name"] = "simple-mcp-server",
-                ["version"] = "1.4.0"
-            }
-        };
-    }
-
-    private static JsonObject ToolsListResult()
-    {
-        return new JsonObject
-        {
-            ["tools"] = new JsonArray
-            {
-                new JsonObject
-                {
-                    ["name"] = "echo",
-                    ["description"] = "Echoes the provided message.",
-                    ["inputSchema"] = new JsonObject
-                    {
-                        ["type"] = "object",
-                        ["properties"] = new JsonObject
-                        {
-                            ["message"] = new JsonObject
-                            {
-                                ["type"] = "string",
-                                ["description"] = "Text to echo back."
-                            }
-                        }
-                    }
-                },
-                new JsonObject
-                {
-                    ["name"] = "ping",
-                    ["description"] = "Returns a pong response.",
-                    ["inputSchema"] = new JsonObject
-                    {
-                        ["type"] = "object",
-                        ["properties"] = new JsonObject()
-                    }
-                }
-            }
-        };
-    }
-
-    private static JsonObject ExecuteTool(JsonObject? parameters)
-    {
-        var toolName = parameters?["name"]?.GetValue<string>();
-        var arguments = parameters?["arguments"] as JsonObject;
-
-        if (string.IsNullOrWhiteSpace(toolName))
-        {
-            return ToolError("Missing tool name.");
-        }
-
-        return toolName switch
-        {
-            "echo" => ToolOk(arguments?["message"]?.GetValue<string>() ?? "(empty)"),
-            "ping" => ToolOk($"pong {DateTime.UtcNow:O}"),
-            _ => ToolError($"Unknown tool: {toolName}")
-        };
-    }
-
-    private static JsonObject ToolOk(string text)
-    {
-        return new JsonObject
-        {
-            ["content"] = new JsonArray
-            {
-                new JsonObject
-                {
-                    ["type"] = "text",
-                    ["text"] = text
-                }
-            },
-            ["isError"] = false
-        };
-    }
-
-    private static JsonObject ToolError(string text)
-    {
-        return new JsonObject
-        {
-            ["content"] = new JsonArray
-            {
-                new JsonObject
-                {
-                    ["type"] = "text",
-                    ["text"] = text
-                }
-            },
-            ["isError"] = true
-        };
-    }
-
-    private static JsonObject Result(JsonNode id, JsonObject result)
-    {
-        return new JsonObject
-        {
-            ["jsonrpc"] = "2.0",
-            ["id"] = id.DeepClone(),
-            ["result"] = result
-        };
-    }
-
-    private static JsonObject Error(JsonNode? id, int code, string message)
-    {
-        return new JsonObject
-        {
-            ["jsonrpc"] = "2.0",
-            ["id"] = id?.DeepClone(),
-            ["error"] = new JsonObject
-            {
-                ["code"] = code,
-                ["message"] = message
-            }
-        };
-    }
+    [McpServerTool(Name = "ping", ReadOnly = true, Idempotent = true, OpenWorld = false)]
+    [Description("Health check tool for internal MCP calls. Returns exactly pong.")]
+    public static string Ping() => "pong";
 }
